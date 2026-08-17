@@ -1,37 +1,41 @@
+#!/usr/bin/env python3
 """
-Deterministic synthesis: turns a set of SourceResults into a Verdict.
-
-No LLM, no fuzzy "vibes" - every branch here is an explicit, inspectable
-rule, because the brief requires every answer (or refusal) to be
-justifiable by naming which sources were used, which were skipped, and why.
+Mechanical implementation of CONTEXT.md in this folder: turns stage 2's
+source_results.json into a verdict.json + human-readable report. Every
+branch here maps directly to a row in CONTEXT.md's decision table - no
+LLM call, no fuzzy judgment, so every verdict is reproducible and its
+reasoning can be read straight off this file.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import argparse
+import json
+import os
+import sys
+from dataclasses import asdict, dataclass, field
+from types import SimpleNamespace
 from typing import Optional
 
-from factchecker.sources import SourceResult
-
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 NUMERIC_ATTRIBUTES = {"population", "area"}
-NUMERIC_TOLERANCE = 0.10  # sources rarely agree on population to the digit
+NUMERIC_TOLERANCE = 0.10
 
 
 @dataclass
 class Verdict:
     status: str  # "answered" | "declined"
     answer: Optional[str]
-    confidence: Optional[str]  # "HIGH" | "MEDIUM" | None
+    confidence: Optional[str]
     reason: str
-    sources_used: list[str] = field(default_factory=list)
-    sources_skipped: list[tuple[str, str]] = field(default_factory=list)
+    sources_used: list = field(default_factory=list)
+    sources_skipped: list = field(default_factory=list)
 
 
 def values_agree(a: str, b: str, attribute: str) -> bool:
     if attribute in NUMERIC_ATTRIBUTES:
         try:
-            na = float(a.replace(",", ""))
-            nb = float(b.replace(",", ""))
+            na, nb = float(a.replace(",", "")), float(b.replace(",", ""))
         except ValueError:
             return a.strip().lower() == b.strip().lower()
         if na == 0 or nb == 0:
@@ -40,27 +44,29 @@ def values_agree(a: str, b: str, attribute: str) -> bool:
     return a.strip().lower() == b.strip().lower()
 
 
-def reconcile(wikidata: SourceResult, csv: SourceResult, wikipedia: Optional[SourceResult], attribute: str) -> Verdict:
+def reconcile(wikidata, csv, wikipedia, attribute: str) -> Verdict:
+    """wikidata/csv/wikipedia are objects with .status/.value/.detail/.extra
+    (a SimpleNamespace loaded from JSON, or the live SourceResult dataclass
+    from stage 2 - both work, this function only reads attributes)."""
     structured = {"wikidata": wikidata, "local_csv": csv}
     ok = {name: r for name, r in structured.items() if r.status == "ok"}
     failed = {name: r for name, r in structured.items() if r.status != "ok"}
-    sources_skipped: list[tuple[str, str]] = [(name, r.detail) for name, r in failed.items()]
+    sources_skipped: list = [(name, r.detail) for name, r in failed.items()]
 
-    # --- 0 structured sources succeeded -----------------------------------
+    # --- 0 structured sources succeeded -------------------------------
     if not ok:
-        if wikipedia is not None:
-            sources_skipped.append(("wikipedia", "no candidate values to corroborate (wikidata and local_csv both failed)"))
+        sources_skipped.append(("wikipedia", wikipedia.detail))
         return Verdict(
             status="declined", answer=None, confidence=None,
             reason="No source produced a value: " + "; ".join(f"{n} ({d})" for n, d in sources_skipped),
             sources_used=[], sources_skipped=sources_skipped,
         )
 
-    # --- exactly 1 structured source succeeded -----------------------------
+    # --- exactly 1 structured source succeeded --------------------------
     if len(ok) == 1:
         (name, r), = ok.items()
         value = r.value
-        if wikipedia is not None and wikipedia.status == "ok":
+        if wikipedia.status == "ok":
             corroborated = name in wikipedia.extra.get("corroborated", [])
             if corroborated:
                 return Verdict(
@@ -76,34 +82,33 @@ def reconcile(wikidata: SourceResult, csv: SourceResult, wikipedia: Optional[Sou
                         f"contain it. Not independently corroborated, so not treating it as confirmed."),
                 sources_used=[], sources_skipped=sources_skipped,
             )
-        wiki_reason = wikipedia.detail if wikipedia is not None else "not queried"
-        sources_skipped.append(("wikipedia", wiki_reason))
+        sources_skipped.append(("wikipedia", wikipedia.detail))
         return Verdict(
             status="declined", answer=value, confidence=None,
             reason=(f"Only {name} responded ({value}); no second source could corroborate it "
-                    f"(wikipedia: {wiki_reason}). A single uncorroborated source is not enough to answer confidently."),
+                    f"(wikipedia: {wikipedia.detail}). A single uncorroborated source is not enough to answer confidently."),
             sources_used=[], sources_skipped=sources_skipped,
         )
 
-    # --- both structured sources succeeded ---------------------------------
+    # --- both structured sources succeeded -------------------------------
     wd_val, csv_val = ok["wikidata"].value, ok["local_csv"].value
     if values_agree(wd_val, csv_val, attribute):
         sources_used = ["wikidata", "local_csv"]
         reason = f"wikidata and local_csv independently agree: {wd_val}."
-        if wikipedia is not None and wikipedia.status == "ok":
+        if wikipedia.status == "ok":
             if wikipedia.extra.get("corroborated"):
                 sources_used.append("wikipedia")
                 reason += " Wikipedia's summary text also corroborates this."
             else:
                 sources_skipped.append(("wikipedia", "text did not literally contain the value (soft signal, not treated as a conflict)"))
-        elif wikipedia is not None:
+        else:
             sources_skipped.append(("wikipedia", wikipedia.detail))
         return Verdict(status="answered", answer=wd_val, confidence="HIGH", reason=reason,
                         sources_used=sources_used, sources_skipped=sources_skipped)
 
     # conflict between wikidata and local_csv
     tie_break = None
-    if wikipedia is not None and wikipedia.status == "ok":
+    if wikipedia.status == "ok":
         corroborated = set(wikipedia.extra.get("corroborated", []))
         if "wikidata" in corroborated and "local_csv" not in corroborated:
             tie_break = "wikidata"
@@ -122,16 +127,66 @@ def reconcile(wikidata: SourceResult, csv: SourceResult, wikipedia: Optional[Sou
             sources_skipped=sources_skipped + [(loser, f"disagreed with the corroborated value ({loser_val})")],
         )
 
-    wiki_note = ""
-    if wikipedia is not None and wikipedia.status == "ok":
-        wiki_note = " Wikipedia's text did not clearly support either value."
-    elif wikipedia is not None:
-        wiki_note = f" Wikipedia could not be used to break the tie ({wikipedia.detail})."
+    wiki_note = " Wikipedia's text did not clearly support either value." if wikipedia.status == "ok" \
+        else f" Wikipedia could not be used to break the tie ({wikipedia.detail})."
     return Verdict(
         status="declined", answer=None, confidence=None,
         reason=(f"wikidata and local_csv disagree (wikidata={wd_val}, local_csv={csv_val}) and no third "
                 f"source can break the tie.{wiki_note} Refusing to guess which is correct."),
         sources_used=[],
-        sources_skipped=[("wikidata", f"conflicting value: {wd_val}"), ("local_csv", f"conflicting value: {csv_val}")]
-        + ([("wikipedia", wikipedia.detail if wikipedia.status != 'ok' else 'inconclusive')] if wikipedia is not None else []),
+        sources_skipped=[("wikidata", f"conflicting value: {wd_val}"), ("local_csv", f"conflicting value: {csv_val}"),
+                          ("wikipedia", wikipedia.detail if wikipedia.status != "ok" else "inconclusive")],
     )
+
+
+def format_report(verdict: Verdict) -> str:
+    lines = []
+    if verdict.status == "answered":
+        lines.append(f"VERDICT: {verdict.answer}")
+        lines.append(f"CONFIDENCE: {verdict.confidence}")
+    else:
+        lines.append("VERDICT: cannot answer with confidence")
+        if verdict.answer:
+            lines.append(f"  (unverified single-source value seen: {verdict.answer} - not reported as fact)")
+    lines.append(f"REASON: {verdict.reason}")
+    lines.append(f"SOURCES USED: {', '.join(verdict.sources_used) or 'none'}")
+    skipped = "; ".join(f"{n} ({d})" for n, d in verdict.sources_skipped) if verdict.sources_skipped else "none"
+    lines.append(f"SOURCES SKIPPED: {skipped}")
+    return "\n".join(lines)
+
+
+def _default_plan_path() -> str:
+    return os.path.join(os.path.dirname(THIS_DIR), "01_planning", "output", "plan.json")
+
+
+def _default_results_path() -> str:
+    return os.path.join(os.path.dirname(THIS_DIR), "02_execution", "output", "source_results.json")
+
+
+def _output_path() -> str:
+    return os.path.join(THIS_DIR, "output", "verdict.json")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Stage 3: reconcile source results into a verdict.")
+    parser.add_argument("--plan", default=_default_plan_path())
+    parser.add_argument("--results", default=_default_results_path())
+    args = parser.parse_args()
+
+    with open(args.plan, encoding="utf-8") as f:
+        plan = json.load(f)
+    with open(args.results, encoding="utf-8") as f:
+        results = [SimpleNamespace(**r) for r in json.load(f)]
+
+    by_name = {r.name: r for r in results}
+    verdict = reconcile(by_name["wikidata"], by_name["local_csv"], by_name["wikipedia"], plan["attribute"])
+
+    with open(_output_path(), "w", encoding="utf-8") as f:
+        json.dump(asdict(verdict), f, indent=2)
+
+    print(format_report(verdict))
+    return 0 if verdict.status == "answered" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

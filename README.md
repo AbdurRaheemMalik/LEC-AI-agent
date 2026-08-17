@@ -1,7 +1,7 @@
 # Multi-source fact checker that degrades gracefully
 
-A small CLI agent that answers factual questions by consulting multiple
-independent sources, and — the actual point of this project — knows how to
+A small agent that answers factual questions by consulting multiple
+independent sources — and, the actual point of this project, knows how to
 say "I can't confirm this" instead of guessing when a source fails, times
 out, or disagrees.
 
@@ -10,12 +10,12 @@ $ python3 factcheck.py "What is the capital of Japan?"
 
 QUESTION: What is the capital of Japan?
 
-PLAN: entity='Japan', attribute='capital'
+PLAN: entity='Japan', attribute='capital' (matched: capital(?:\s+city)?\s+of\s+(.+))
       phase 1 (parallel): wikidata, local_csv
       phase 2 (sequential, depends on phase 1's candidate values): wikipedia corroboration
 
 [wikidata  ] OK       (0.42s)  -> Tokyo  Wikidata entity Q17, property P36
-[local_csv ] OK       (0.00s)  -> Tokyo  row matched in data/local_facts.csv
+[local_csv ] OK       (0.00s)  -> Tokyo  row matched in 02_execution/references/local_facts.csv
 [wikipedia ] OK       (0.09s)  -> wikidata:match; local_csv:match  Japan is an island country...
 
 VERDICT: Tokyo
@@ -25,7 +25,7 @@ SOURCES USED: wikidata, local_csv, wikipedia
 SOURCES SKIPPED: none
 ```
 
-## Setup
+## How to run it
 
 Python 3.9+, no `pip install` needed — everything is standard library
 (`urllib`, `json`, `csv`, `concurrent.futures`). Needs internet access for
@@ -35,168 +35,158 @@ the Wikidata and Wikipedia calls.
 python3 factcheck.py "What is the capital of Japan?"
 ```
 
-## Scope: what questions this can actually verify
+Force a source to fail, to see graceful degradation on demand:
 
-"General factual question" is honestly bounded here to **attribute-of-entity
-questions** — "what is the X of Y" — because that's the shape of question
-free structured APIs can verify without an LLM in the loop making things up.
-Supported attributes: `capital`, `population`, `currency`,
-`official_language`, `area`, `head_of_government`, `head_of_state`,
-`founded`, `author`, `birth_date`. This covers countries, people, companies,
-books — genuinely general, not just "country facts" — but a question outside
-that shape (`"What is the meaning of life?"`) gets an explicit refusal, not a
-guess:
-
-```
-$ python3 factcheck.py "What is the meaning of life?"
-PLAN: could not map this question to a verifiable (entity, attribute) pair.
-VERDICT: declining to answer.
-REASON: this question isn't in a shape my sources can independently verify...
-```
-
-That refusal path is deliberate, not a limitation to hide — it's the same
-"never guess" discipline applied one level earlier, before any source is
-even queried.
-
-## Why no local LLM
-
-The brief lists a local LLM as one example source among several ("for
-example, a local LLM, a free public API... or a CSV file") — it isn't
-required. No Ollama/local model was available in the build environment, and
-more importantly: an LLM can't independently *verify* a fact, it can only
-assert one, which cuts against the core requirement of never returning an
-answer that can't be justified by named, checkable sources. Instead this
-uses three sources that are each independently checkable:
-
-1. **Wikidata** — structured facts via property IDs (P36 capital, P1082
-   population, P38 currency, etc.), resolved through
-   `www.wikidata.org/w/api.php`.
-2. **Wikipedia** — free-text corroboration via
-   `en.wikipedia.org/api/rest_v1/page/summary/{title}`.
-3. **A local CSV** (`data/local_facts.csv`) — a small user-curated reference
-   file. This is the source we deliberately break in the demo below.
-
-A local LLM would be a fine *fourth* source to bolt on later (`sources.py`
-is built so adding one is just another `*_source()` function returning a
-`SourceResult`) — it just isn't one of the two-plus independent sources this
-build leans on for actually verifying anything.
-
-## Architecture
-
-```
-factcheck.py        CLI: parses args, runs the pipeline, prints the report
-factchecker/
-  planner.py         question -> Plan(entity, attribute), or None (no guess)
-  sources.py          wikidata_source / wikipedia_source / csv_source
-  synth.py            SourceResults -> Verdict (deterministic, no LLM)
-data/local_facts.csv  curated reference data (the source we break on demand)
-tests/                offline unit tests for planner.py and synth.py
-```
-
-**Planning.** `planner.py` matches the question against a set of patterns
-(`"capital of X"`, `"who wrote X"`, `"when was X founded"`, ...) to decide
-*which* entity and attribute are being asked about, and therefore which
-sources are even relevant. No match -> no plan -> explicit decline.
-
-**Execution order is a deliberate two-phase plan, not "just run everything
-in parallel":**
-- **Phase 1 (parallel):** Wikidata and the local CSV are independent
-  structured-value sources with no dependency on each other, so they run
-  concurrently via `ThreadPoolExecutor`, each with its own timeout and its
-  own try/except (one source failing never takes down the run).
-- **Phase 2 (sequential, deliberately):** Wikipedia doesn't produce a
-  structured value on its own — reliably extracting "the capital" from
-  free-text prose without an LLM isn't honest to attempt. Instead it
-  corroborates: it checks whether the candidate value(s) phase 1 already
-  produced appear in the Wikipedia summary text. That means phase 2 has a
-  genuine dependency on phase 1's output, so it runs after — this is the
-  agent's decision about ordering, not an accident.
-
-**Synthesis** (`synth.py`, pure functions, no I/O, fully unit-tested) is a
-deterministic decision tree:
-
-| Structured sources (Wikidata, CSV) | Wikipedia | Result |
-|---|---|---|
-| 0 succeeded | — | **Decline.** Every failure reason listed. |
-| 1 succeeded | corroborates it | **Answer, MEDIUM confidence** — 2 independent sources effectively agree. |
-| 1 succeeded | doesn't corroborate / unavailable | **Decline.** A single uncorroborated source isn't enough. Value shown but explicitly marked unverified. |
-| 2 succeeded, agree | corroborates | **Answer, HIGH confidence.** |
-| 2 succeeded, agree | fails / doesn't corroborate | **Answer, HIGH confidence** (2 structured DBs agreeing is strong; a text miss is a soft signal, not a conflict — noted, not hidden). |
-| 2 succeeded, **disagree** | corroborates one side | **Answer, MEDIUM confidence**, but the conflict and the losing value are named in the report, never hidden. |
-| 2 succeeded, **disagree** | can't break the tie | **Decline.** Both conflicting values shown, no arbitrary pick. |
-
-Numeric attributes (population, area) are compared with a 10% relative
-tolerance rather than exact match, since sources snapshot at different
-times. Everything else is case-insensitive exact match.
-
-## Demoing source failure
-
-Two ways, both real (not mocked in a way that fakes success):
-
-**1. Delete/rename the file** (literal "deleting a file" from the brief):
 ```bash
-mv data/local_facts.csv data/local_facts.csv.bak
-python3 factcheck.py "What is the capital of France?"
-mv data/local_facts.csv.bak data/local_facts.csv   # restore after
-```
-`csv_source` catches the real `FileNotFoundError` and reports it; the agent
-falls back to Wikidata + Wikipedia agreeing, at reduced (MEDIUM) confidence,
-explicitly naming the CSV as skipped and why.
-
-**2. Force a simulated HTTP 500** on any one source, repeatable on demand:
-```bash
-python3 factcheck.py "What is the capital of Japan?" --simulate-failure wikidata
+python3 factcheck.py "What is the capital of France?" --simulate-failure wikidata
 ```
 
-## Demo script (for the 3-minute video)
-
-**Query 1 — everything working (≈45s):**
-```bash
-python3 factcheck.py "What is the capital of Japan?"
-```
-Narrate: three independent sources queried, two run in parallel
-(Wikidata + local CSV), Wikipedia corroborates afterward, all three agree,
-HIGH confidence, and the report names every source used.
-
-**Query 2 — inject a real failure, show graceful degradation (≈90s):**
-```bash
-mv data/local_facts.csv data/local_facts.csv.bak
-python3 factcheck.py "What is the capital of France?"
-```
-Narrate: the local CSV file is now missing. The agent doesn't crash and
-doesn't pretend the CSV worked — it reports `local_csv FAILED: file not
-found`, falls back to Wikidata + Wikipedia which independently agree, and
-answers at MEDIUM (not HIGH) confidence, explicitly stating the CSV was
-skipped and why. Then restore the file:
-```bash
-mv data/local_facts.csv.bak data/local_facts.csv
-```
-
-**Bonus, if time remains (≈30s) — a question it correctly refuses:**
-```bash
-python3 factcheck.py "What is the meaning of life?"
-```
-Narrate: out of scope for what these sources can verify, so it declines
-outright rather than guessing.
-
-## Testing
+Run the offline unit test suite (no network needed):
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
-16 offline unit tests over `planner.py` (question -> plan matching, incl.
-the out-of-scope no-plan case) and `synth.py` (every branch of the decision
-tree above, using hand-built `SourceResult`s — no network required, so
-these run identically in CI).
+
+Run any single stage on its own — see "Architecture" below for why this
+works:
+
+```bash
+python3 01_planning/run.py "What is the population of Germany?"
+python3 02_execution/run.py --plan 01_planning/output/plan.json
+python3 03_synthesis/run.py --plan 01_planning/output/plan.json --results 02_execution/output/source_results.json
+```
+
+## Architecture: folder structure as the agent's architecture
+
+Instead of one monolithic script or a multi-agent framework, this is
+organized the way Jake Van Cleef's *Interpretable Context Methodology*
+describes it: the pipeline is **three numbered stage folders**, each with
+a `CONTEXT.md` that is the actual spec for that stage — inputs, process,
+outputs, written as instructions a reader (human or agent) can follow —
+and a `run.py` that's one faithful, mechanical implementation of that
+spec. Root-level `CLAUDE.md` and `CONTEXT.md` give the workspace identity
+and routing, the same way they would for a Claude Code skill.
+
+```
+CLAUDE.md                 workspace identity ("what is this, where do I go")
+CONTEXT.md                 task routing ("run stage 1, then 2, then 3")
+_config/glossary.md        shared reference: supported attributes, Wikidata property IDs
+
+01_planning/
+  CONTEXT.md                contract: question -> {entity, attribute}, or an explicit refusal
+  run.py                     mechanical regex matcher implementing that contract
+  output/plan.json           what this run decided
+
+02_execution/
+  CONTEXT.md                 contract: query the sources named in the plan, record what happened
+  run.py                     wikidata_source / wikipedia_source / csv_source + phase 1/2 orchestration
+  references/local_facts.csv the local, user-curated source — deliberately breakable for the demo
+  output/source_results.json what each source returned or how it failed
+
+03_synthesis/
+  CONTEXT.md                  contract: the full decision table for reconciling results into a verdict
+  run.py                       mechanical implementation of that table
+  output/verdict.json          the final answer/refusal, with reasons
+
+_stage_loader.py              the one bit of "finding the correct files" plumbing in code
+factcheck.py                  thin orchestrator: loads the 3 stage modules, runs them in order, prints the report
+tests/                        offline unit tests over 01_planning and 03_synthesis (no network)
+```
+
+**Stages talk to each other only through files in `output/`** — stage 2
+reads stage 1's `plan.json`, stage 3 reads stage 2's
+`source_results.json`. No stage imports another stage's code. That's why
+each stage above can also be run completely standalone from the command
+line: the contract is genuinely file-in, file-out, not just an internal
+function call dressed up in folders.
+
+**Why markdown for the "what to do", Python only for the mechanical
+part:** deciding *what a stage should do* — which question shapes count as
+"capital of X", how to reconcile two disagreeing sources, when a text
+corroboration counts as a soft signal versus a hard conflict — is
+documented as prose in each `CONTEXT.md`, because that's what a person (or
+another agent extending this later) needs to read to understand or change
+the system's judgment calls. Actually *doing* the work — an HTTP request,
+a regex match, a 10%-tolerance number comparison — doesn't need
+"judgment," so it's ordinary deterministic code in `run.py`. The
+`CONTEXT.md` is the authority; `run.py` is required to match it, not the
+reverse.
+
+## Sources, and why no local LLM
+
+1. **Wikidata** — structured facts by property ID (P36 capital, P1082
+   population, etc. — full list in
+   [`_config/glossary.md`](_config/glossary.md)).
+2. **local_csv** — a small hand-curated reference file
+   (`02_execution/references/local_facts.csv`). This is the source
+   deliberately broken in the demo below.
+3. **Wikipedia** — free-text summary, used only to *corroborate* whatever
+   candidate value(s) Wikidata/local_csv already produced (see
+   `02_execution/CONTEXT.md` for why it can't stand alone as a
+   structured-value source).
+
+No local LLM is used, by design, not by necessity. The brief lists one as
+an *example* source, not a requirement, and an LLM can assert a fact but
+can't independently verify one — using it as a "source" would work against
+the core requirement that every answer be justifiable by named, checkable
+sources. `02_execution/run.py` is built so a fourth source (an LLM or
+otherwise) is just another `*_source()` function returning the same
+`SourceResult` shape.
+
+## Demoing a source failure
+
+```bash
+mv 02_execution/references/local_facts.csv 02_execution/references/local_facts.csv.bak
+python3 factcheck.py "What is the capital of France?"
+mv 02_execution/references/local_facts.csv.bak 02_execution/references/local_facts.csv   # restore after
+```
+`csv_source` catches the real `FileNotFoundError` and reports it; the
+agent falls back to Wikidata + Wikipedia agreeing, at reduced (MEDIUM, not
+HIGH) confidence, explicitly naming the CSV as skipped and why. Or force
+any single source to fail on demand:
+```bash
+python3 factcheck.py "What is the capital of Japan?" --simulate-failure wikidata
+```
+
+## What I'd do next with more time
+
+- **Replace regex planning with LLM-assisted planning, kept auditable.**
+  The pattern list in `01_planning/CONTEXT.md` covers ten question shapes
+  well; real users phrase things ten other ways. The fix isn't to drop the
+  contract-file architecture, it's to let a model read
+  `01_planning/CONTEXT.md` itself and produce the same `plan.json` shape —
+  the file was written to be followable by a model as much as by `run.py`,
+  so this is a swap-in, not a redesign.
+- **A fourth, genuinely independent source** — a free weather/news API for
+  time-sensitive facts, or a second structured database (e.g. REST
+  Countries) as a check on Wikidata specifically, since right now Wikidata
+  and Wikipedia are correlated (same underlying editorial community) even
+  though they're separately queried.
+- **Confidence calibration against ground truth.** Right now HIGH/MEDIUM
+  is a rule of thumb (3/3, 2/3, or 2/2-plus-text-corroboration). Running
+  this against a labeled set of questions with known-correct answers would
+  turn "MEDIUM" into an actual calibrated probability instead of a label.
+- **Caching + rate-limit handling.** Wikidata/Wikipedia calls aren't
+  cached, so repeated questions re-fetch every time and there's no
+  backoff if a source starts rate-limiting mid-run — fine for a demo,
+  not for real usage volume.
+- **Broader attribute coverage without a linear blow-up in patterns** —
+  right now every new attribute is a new regex in
+  `01_planning/CONTEXT.md`/`run.py` and a new PID row in
+  `_config/glossary.md`. Past a few dozen attributes this should become a
+  small routing table (or the LLM-planning swap above) rather than more
+  regex.
+- **A conflict-resolution UI**, not just CLI text — when two sources
+  disagree and there's no tiebreaker, the current behavior is a clean
+  refusal in the terminal; a real product would let the user pick a
+  source to trust and remember that preference.
 
 ## Known limitations
 
-- Question understanding is regex/pattern based, not NLP — phrasing outside
-  the supported patterns won't match even if a human would understand it.
-  This is intentional: a pattern miss produces an honest "I can't verify
-  this" rather than a fuzzy LLM guess at intent.
+- Question understanding is pattern-based, not free-form NLP — phrasing
+  outside the ten supported shapes produces an honest refusal rather than
+  a guess. Intentional (see above), not hidden.
 - Wikidata entity resolution takes the top fuzzy-search hit; for very
-  ambiguous names (e.g. common words) it can resolve to the wrong entity.
-  The report always names the resolved Wikidata QID so this is inspectable,
-  not hidden.
-- Only English Wikipedia/Wikidata are queried.
+  ambiguous names it can resolve to the wrong entity. The report always
+  names the resolved Wikidata QID, so this is inspectable, not silent.
+- English Wikipedia/Wikidata only.
