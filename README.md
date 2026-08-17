@@ -157,19 +157,6 @@ python3 factcheck.py "What is the capital of Japan?" --simulate-failure wikidata
   `01_planning/CONTEXT.md` itself and produce the same `plan.json` shape —
   the file was written to be followable by a model as much as by `run.py`,
   so this is a swap-in, not a redesign.
-- **A fourth, genuinely independent source** — a free weather/news API for
-  time-sensitive facts, or a second structured database (e.g. REST
-  Countries) as a check on Wikidata specifically, since right now Wikidata
-  and Wikipedia are correlated (same underlying editorial community) even
-  though they're separately queried.
-- **Confidence calibration against ground truth.** Right now HIGH/MEDIUM
-  is a rule of thumb (3/3, 2/3, or 2/2-plus-text-corroboration). Running
-  this against a labeled set of questions with known-correct answers would
-  turn "MEDIUM" into an actual calibrated probability instead of a label.
-- **Caching + rate-limit handling.** Wikidata/Wikipedia calls aren't
-  cached, so repeated questions re-fetch every time and there's no
-  backoff if a source starts rate-limiting mid-run — fine for a demo,
-  not for real usage volume.
 - **Broader attribute coverage without a linear blow-up in patterns** —
   right now every new attribute is a new regex in
   `01_planning/CONTEXT.md`/`run.py` and a new PID row in
